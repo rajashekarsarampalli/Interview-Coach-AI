@@ -1,0 +1,370 @@
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
+from langchain_ollama import ChatOllama
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from TTS.api import TTS
+import asyncio, base64, io, json, re, numpy as np
+import scipy.io.wavfile as wav
+from datetime import datetime
+import threading
+
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# ── TTS ── (pre-warmed in background)
+tts_engine = None
+VOICE_ALEX = "p226"  # Male - Senior Engineer
+VOICE_SAM  = "p225"  # Female - Energetic HR (was p225)
+
+def get_tts():
+    global tts_engine
+    if tts_engine is None:
+        print("⏳ Loading Coqui TTS...")
+        tts_engine = TTS(model_name="tts_models/en/vctk/vits", progress_bar=False, gpu=False)
+        print("✅ TTS ready")
+    return tts_engine
+
+# ── LLMs ── (pre-warmed in background)
+llm_alex = None
+llm_sam  = None
+llm_eval = None
+
+def get_llm_alex():
+    global llm_alex
+    if llm_alex is None:
+        print("⏳ Loading Alex LLM (llama3.1:8b)...")
+        llm_alex = ChatOllama(model="llama3.1:8b", temperature=0.6, num_predict=100)
+        print("✅ Alex LLM ready")
+    return llm_alex
+
+def get_llm_sam():
+    global llm_sam
+    if llm_sam is None:
+        print("⏳ Loading Sam LLM (gemma2:2b)...")
+        llm_sam = ChatOllama(model="gemma2:2b", temperature=0.6, num_predict=100)
+        print("✅ Sam LLM ready")
+    return llm_sam
+
+def get_llm_eval():
+    global llm_eval
+    if llm_eval is None:
+        print("⏳ Loading Eval LLM (llama3.1:8b)...")
+        llm_eval = ChatOllama(model="llama3.1:8b", temperature=0.1)
+        print("✅ Eval LLM ready")
+    return llm_eval
+
+# Background warmup
+def warmup_models():
+    print("🔥 Warming up models in background...")
+    get_tts()
+    get_llm_alex()
+    get_llm_sam()
+    print("🎉 All models ready!")
+
+@app.on_event("startup")
+async def startup_event():
+    # Start model warmup in background thread
+    threading.Thread(target=warmup_models, daemon=True).start()
+    print("✅ Server ready - models loading in background...")
+
+# ── Interview Modes ──
+MODES = {
+    "software_engineer": {
+        "title": "Software Engineer", "emoji": "💻",
+        "alex_focus": "algorithms, data structures, system design, Big-O, databases, APIs",
+        "sam_focus":  "teamwork, handling disagreements, engineering culture, growth mindset"
+    },
+    "frontend": {
+        "title": "Frontend Developer", "emoji": "🎨",
+        "alex_focus": "React, CSS, browser performance, accessibility, JavaScript, bundlers",
+        "sam_focus":  "design collaboration, user empathy, cross-functional communication"
+    },
+    "data_science": {
+        "title": "Data Scientist", "emoji": "📊",
+        "alex_focus": "ML algorithms, statistics, model evaluation, feature engineering, Python, SQL",
+        "sam_focus":  "translating insights to business value, stakeholder management"
+    },
+    "product_manager": {
+        "title": "Product Manager", "emoji": "🗂️",
+        "alex_focus": "technical feasibility, engineering constraints, data-driven decisions",
+        "sam_focus":  "product vision, user research, roadmap prioritization, conflict resolution"
+    }
+}
+
+# ── Sessions ──
+sessions: dict = {}
+
+def create_session(sid: str, mode: str, candidate_name: str = "Candidate"):
+    m = MODES.get(mode, MODES["software_engineer"])
+    hist_alex = InMemoryChatMessageHistory()
+    hist_sam  = InMemoryChatMessageHistory()
+
+    prompt_alex = ChatPromptTemplate.from_messages([
+        ("system", f"""You are Alex, a Senior Engineer conducting a {m['title']} interview.
+Panel partner: Sam (HR). Candidate: {candidate_name}.
+Technical focus: {m['alex_focus']}
+STRICT RULES:
+- Maximum 2-3 sentences. Be concise and natural.
+- Occasionally address Sam (start with "Sam,")
+- Sharp, direct, technical tone
+- Zero markdown, bullets, asterisks, or special characters"""),
+        MessagesPlaceholder(variable_name="history"),
+        ("human", "{input}")
+    ])
+
+    prompt_sam = ChatPromptTemplate.from_messages([
+        ("system", f"""You are Sam, HR specialist conducting a {m['title']} interview.
+Panel partner: Alex (Technical). Candidate: {candidate_name}.
+Behavioral focus: {m['sam_focus']}
+STRICT RULES:
+- Maximum 2-3 sentences. Be concise and natural.
+- Occasionally address Alex (start with "Alex,")
+- Warm, professional, encouraging tone
+- Zero markdown, bullets, asterisks, or special characters"""),
+        MessagesPlaceholder(variable_name="history"),
+        ("human", "{input}")
+    ])
+
+    conv_alex = RunnableWithMessageHistory(
+        prompt_alex | get_llm_alex(),
+        lambda s: hist_alex,
+        input_messages_key="input", history_messages_key="history"
+    )
+    conv_sam = RunnableWithMessageHistory(
+        prompt_sam | get_llm_sam(),
+        lambda s: hist_sam,
+        input_messages_key="input", history_messages_key="history"
+    )
+
+    sessions[sid] = {
+        "mode": mode, "mode_title": m["title"], "emoji": m["emoji"],
+        "candidate_name": candidate_name,
+        "conv_alex": conv_alex, "conv_sam": conv_sam,
+        "transcript": [], "start_time": datetime.now().isoformat(),
+        "suspicious_events": []
+    }
+    return sessions[sid]
+
+def get_session(sid): return sessions.get(sid)
+
+# ── Helpers ──
+def split_sentences(text: str) -> list:
+    # Faster sentence splitting - aim for 15-40 chars per chunk for quick TTS
+    parts = re.split(r'(?<=[.!?])\s+', text.strip())
+    merged, i = [], 0
+    while i < len(parts):
+        if i + 1 < len(parts) and len(parts[i]) < 20:
+            merged.append(parts[i] + " " + parts[i+1]); i += 2
+        else:
+            merged.append(parts[i]); i += 1
+    return [s.strip() for s in merged if s.strip()]
+
+def clean_for_tts(text: str) -> str:
+    text = re.sub(r'\*+', '', text)
+    text = re.sub(r'[^\w\s\.,!?;:\'\-]', ' ', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+# TTS cache for faster repeated phrases
+_tts_cache = {}
+
+def tts_to_base64(text: str, speaker: str) -> str:
+    cache_key = f"{speaker}:{text}"
+    if cache_key in _tts_cache:
+        return _tts_cache[cache_key]
+    
+    voice = VOICE_ALEX if speaker == "alex" else VOICE_SAM
+    cleaned = clean_for_tts(text)
+    if not cleaned: return ""
+    audio = get_tts().tts(text=cleaned, speaker=voice)
+    buf = io.BytesIO()
+    wav.write(buf, rate=22050, data=np.array(audio, dtype=np.float32))
+    buf.seek(0)
+    result = base64.b64encode(buf.read()).decode()
+    
+    # Cache only short phrases to save memory
+    if len(text) < 100:
+        _tts_cache[cache_key] = result
+    
+    return result
+
+def sse(data: dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
+
+async def stream_speaker(speaker: str, conv, sid: str, prompt_input: str, session: dict):
+    result = await asyncio.to_thread(
+        lambda: conv.invoke(
+            {"input": prompt_input},
+            config={"configurable": {"session_id": sid}}
+        )
+    )
+    full_text = result.content
+    session["transcript"].append({
+        "speaker": speaker, "text": full_text,
+        "time": datetime.now().isoformat()
+    })
+    yield sse({"type": "speaker_start", "speaker": speaker, "full_text": full_text})
+    for sentence in split_sentences(full_text):
+        audio_b64 = await asyncio.to_thread(tts_to_base64, sentence, speaker)
+        yield sse({"type": "sentence", "speaker": speaker, "text": sentence, "audio": audio_b64})
+    yield sse({"type": "speaker_done", "speaker": speaker})
+
+# ── Request Models ──
+class StartRequest(BaseModel):
+    session_id: str
+    mode: str = "software_engineer"
+    candidate_name: str = "Candidate"
+
+class MessageRequest(BaseModel):
+    message: str
+    session_id: str
+
+class SuspiciousEvent(BaseModel):
+    session_id: str
+    event_type: str
+    description: str
+
+class FeedbackRequest(BaseModel):
+    session_id: str
+
+# ── Routes ──
+@app.get("/")
+def root(): return FileResponse("static/index.html")
+
+@app.get("/modes")
+def get_modes():
+    return {k: {"title": v["title"], "emoji": v["emoji"]} for k, v in MODES.items()}
+
+@app.post("/start")
+def start_interview(req: StartRequest):
+    s = create_session(req.session_id, req.mode, req.candidate_name)
+    return {"status": "ok", "mode_title": s["mode_title"], "emoji": s["emoji"]}
+
+@app.post("/chat/stream")
+async def chat_stream(request: MessageRequest):
+    session = get_session(request.session_id)
+    if not session:
+        async def err():
+            yield sse({"type": "error", "message": "Session not found."})
+        return StreamingResponse(err(), media_type="text/event-stream")
+
+    session["transcript"].append({
+        "speaker": "candidate",
+        "text": request.message,
+        "time": datetime.now().isoformat()
+    })
+
+    async def generate():
+        alex_text = ""
+        sam_text  = ""
+
+        async for chunk in stream_speaker(
+            "alex", session["conv_alex"], request.session_id,
+            f'The candidate just said: "{request.message}"', session
+        ):
+            if chunk.startswith("data:"):
+                d = json.loads(chunk[6:].strip())
+                if d.get("type") == "speaker_start": alex_text = d["full_text"]
+            yield chunk
+
+        async for chunk in stream_speaker(
+            "sam", session["conv_sam"], request.session_id,
+            f'Candidate said: "{request.message}"\nAlex responded: "{alex_text}"', session
+        ):
+            if chunk.startswith("data:"):
+                d = json.loads(chunk[6:].strip())
+                if d.get("type") == "speaker_start": sam_text = d["full_text"]
+            yield chunk
+
+        if sam_text.strip().lower().startswith("alex,"):
+            async for chunk in stream_speaker(
+                "alex", session["conv_alex"], request.session_id,
+                f'Sam said: "{sam_text}". Respond briefly or redirect to candidate.', session
+            ):
+                yield chunk
+
+        yield sse({"type": "done"})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+
+@app.post("/log-suspicious")
+def log_suspicious(event: SuspiciousEvent):
+    session = get_session(event.session_id)
+    if session:
+        session["suspicious_events"].append({
+            "type": event.event_type,
+            "description": event.description,
+            "time": datetime.now().isoformat()
+        })
+    return {"status": "logged"}
+
+@app.post("/feedback")
+async def get_feedback(req: FeedbackRequest):
+    session = get_session(req.session_id)
+    if not session: return {"error": "Session not found"}
+
+    transcript_text = "\n".join([
+        f"{e['speaker'].upper()}: {e['text']}" for e in session["transcript"]
+    ])
+    suspicious_summary = ""
+    if session["suspicious_events"]:
+        suspicious_summary = "\n\nSUSPICIOUS EVENTS:\n" + "\n".join(
+            f"- [{e['type']}] {e['description']}" for e in session["suspicious_events"]
+        )
+
+    prompt = f"""You are an expert interview evaluator for a {session['mode_title']} position.
+Analyze this interview and return ONLY a valid JSON object, no explanation, no markdown fences.
+
+TRANSCRIPT:
+{transcript_text}
+{suspicious_summary}
+
+Return exactly this JSON:
+{{
+  "overall_score": <1-10 float>,
+  "verdict": "<Strong Hire|Hire|Hold|No Hire>",
+  "summary": "<2-3 sentence summary>",
+  "categories": {{
+    "technical":       {{"score": <1-10>, "feedback": "<one sentence>"}},
+    "communication":   {{"score": <1-10>, "feedback": "<one sentence>"}},
+    "problem_solving": {{"score": <1-10>, "feedback": "<one sentence>"}},
+    "cultural_fit":    {{"score": <1-10>, "feedback": "<one sentence>"}},
+    "confidence":      {{"score": <1-10>, "feedback": "<one sentence>"}}
+  }},
+  "strengths":    ["<s1>", "<s2>", "<s3>"],
+  "improvements": ["<a1>", "<a2>"],
+  "integrity_note": "<comment on suspicious events or No issues detected>",
+  "recommendation": "<2-3 sentence hiring recommendation>"
+}}"""
+
+    result = await asyncio.to_thread(lambda: get_llm_eval().invoke(prompt))
+    text = re.sub(r'```json|```', '', result.content).strip()
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try: return json.loads(match.group())
+        except: pass
+    return {"error": "Parse failed", "raw": text}
+
+@app.get("/transcript/{session_id}")
+def get_transcript(session_id: str):
+    session = get_session(session_id)
+    if not session: return {"error": "Session not found"}
+    return {
+        "transcript": session["transcript"],
+        "suspicious_events": session["suspicious_events"],
+        "mode": session["mode_title"],
+        "candidate": session["candidate_name"],
+        "start_time": session["start_time"]
+    }
+
+@app.post("/reset")
+def reset(session_id: str):
+    if session_id in sessions: del sessions[session_id]
+    return {"status": "reset"}

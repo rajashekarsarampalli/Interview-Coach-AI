@@ -1,0 +1,92 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-sans: 'Inter', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  /* Dark Theme Palette - Professional IDE/Dashboard Look */
+  --background: 222 47% 6%;      /* #070b14 */
+  --foreground: 210 40% 98%;     /* #f8fafc */
+
+  --card: 222 47% 10%;           /* #0d1425 */
+  --card-foreground: 210 40% 98%;
+
+  --popover: 222 47% 10%;
+  --popover-foreground: 210 40% 98%;
+
+  --primary: 221 83% 53%;        /* #2563eb (Blue - Alex) */
+  --primary-foreground: 210 40% 98%;
+
+  --secondary: 262 83% 58%;      /* #7c3aed (Purple - Sam) */
+  --secondary-foreground: 210 40% 98%;
+
+  --muted: 217 33% 17%;
+  --muted-foreground: 215 20% 65%;
+
+  --accent: 217 33% 17%;
+  --accent-foreground: 210 40% 98%;
+
+  --destructive: 0 62.8% 30.6%;
+  --destructive-foreground: 210 40% 98%;
+
+  --border: 217 33% 17%;
+  --input: 217 33% 17%;
+  --ring: 224 76% 48%;
+
+  --radius: 0.75rem;
+}
+
+@layer base {
+  body {
+    @apply bg-background text-foreground antialiased selection:bg-primary/30 selection:text-primary-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+  
+  /* Custom Scrollbar for dashboard feel */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-background;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-muted rounded-full hover:bg-muted-foreground/50 transition-colors;
+  }
+}
+
+@layer utilities {
+  .glass-panel {
+    @apply bg-card/80 backdrop-blur-xl border border-white/5 shadow-xl;
+  }
+  
+  .text-glow {
+    text-shadow: 0 0 20px rgba(37, 99, 235, 0.5);
+  }
+
+  .animate-pulse-slow {
+    animation: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+  
+  .bg-grid-pattern {
+    background-image: linear-gradient(to right, #1e293b 1px, transparent 1px),
+                      linear-gradient(to bottom, #1e293b 1px, transparent 1px);
+    background-size: 40px 40px;
+    mask-image: linear-gradient(to bottom, transparent, 10%, white, 90%, transparent);
+  }
+}
+
+/* Animations */
+@keyframes float {
+  0% { transform: translateY(0px); }
+  50% { transform: translateY(-10px); }
+  100% { transform: translateY(0px); }
+}
+
+.animate-float {
+  animation: float 6s ease-in-out infinite;
+}
